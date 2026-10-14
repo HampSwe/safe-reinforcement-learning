@@ -5,3 +5,5 @@ This repository contains an implementation of an anytime safe reinforcement lear
 We have also implemented this in a realistic 3D simulation in Isaac Lab (but in a different repository). Furthermore, we performed system identification on a Crazyflie, and managed to overcome the sim-to-real gap by deploying a trained policy on hardware.
 
 In a separate repository, we also train RL-SGF for a G1 Humanoid in mjlab.
+
+This work was part of my Summer Undergraduate Research Fellowship at the AMBER Lab at Caltech.
