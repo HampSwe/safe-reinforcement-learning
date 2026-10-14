@@ -1,4 +1,4 @@
-# surf
+# Anytime safe RL
 
 This repository contains an implementation of an anytime safe reinforcement learning algorithm ([RL-SGF](https://arxiv.org/abs/2504.16417) by Mestres et al.) with modifications (PPO-style estimates, learning rate scheduling) for a planar quadrotor task. We also provide a simulator/environment of the quadrotor.
 
