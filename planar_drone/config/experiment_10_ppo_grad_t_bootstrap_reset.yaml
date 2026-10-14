@@ -1,0 +1,22 @@
+runner:
+  num_steps_per_env: 0
+  num_steps_per_env_multiplier: 1  # T -- one episode length per rollout/update
+  reset_after_update: true
+  obs_groups: {"actor": ["policy"], "critic": ["policy", "privileged"]}
+  save_interval: 100
+  algorithm:
+    class_name: rsl_rl.algorithms.rl_sgf_ppo_grad:RLSGF_PPOGrad
+    bootstrap_final_state: true
+    critic_use_epochs: true
+    critic_epochs: 3
+    critic_minibatch: 131072
+    lam: 0.95  # GAE(lambda) for V0's advantage weights
+  actor:
+    class_name: MLPModel
+    distribution_cfg:
+      class_name: GaussianDistribution
+      std_type: log
+      init_std: 1.0
+      std_range: [0.2, 2.0]
+  critic:
+    class_name: MLPModel

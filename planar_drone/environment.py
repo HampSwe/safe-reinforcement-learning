@@ -1,0 +1,606 @@
+"""Batched 2D planar quadrotor environment, compatible with rsl_rl's VecEnv.
+
+All state is held as torch tensors of shape (num_envs, ...) on `device`, so the
+whole batch steps in parallel -- this is what lets rsl_rl's PPO collect from
+thousands of envs at once. This is the tensor port of your single-env Drone2D.
+
+VecEnv contract (https://leggedrobotics.github.io/rsl_rl/api/env.html):
+  required attributes : num_envs, num_actions, max_episode_length,
+                        episode_length_buf, device, cfg
+  required methods     : get_observations(), step(actions)
+  step() returns       : (obs TensorDict, rewards (N,), dones (N,), extras dict)
+"""
+
+import math
+import torch
+from tensordict import TensorDict
+
+# --- square world:  x in [-WORLD_X, WORLD_X],  y in [0, WORLD_Y] ---
+WORLD_X = 10   # half-width, so full x-range is [-10, 10]  (width 20)
+WORLD_Y = 20   # y in [0, 20]  -> square 20 x 20
+
+FAILURE_PENALTY = 10000
+TARGET_BONUS = int(100 * 4)
+TARGET_DIS_SCALE = 1
+TARGET_RADIUS = 0.05
+
+OBSTACLE_RADIUS = 0.5
+UNSAFE_REGION_OBSTACLE_RADIUS = OBSTACLE_RADIUS * 1.3
+
+# ------------------------------------------------------------------ #
+# new spawn scheme
+#   - obstacle fixed at CENTER (+ small jitter)
+#   - drone placed randomly on the screen (+ small jitter)
+#   - target on the OPPOSITE side of the center from the drone, at a
+#     random distance from the center within [TARGET_DIST_MIN, MAX]
+#   - drone and target must clear the obstacle by their margins; if not,
+#     resample everything (up to 100 tries)
+# ------------------------------------------------------------------ #
+CENTER = (0.0, WORLD_Y / 2.0)          # obstacle nominal center (x, y) = (0, 10)
+
+DRONE_SPAWN_STD    = 0.05              # jitter on drone position (start tiny)
+OBSTACLE_SPAWN_STD = 0.05             # jitter on obstacle position
+TARGET_SPAWN_STD   = 0.05              # jitter on target position
+
+TARGET_DIST_MIN = 0.5                  # target distance from center, min
+TARGET_DIST_MAX = 8.0                  # target distance from center, max
+
+# min clearance between the obstacle and the drone / target
+DRONE_MARGIN  = UNSAFE_REGION_OBSTACLE_RADIUS + 0.2
+TARGET_MARGIN = UNSAFE_REGION_OBSTACLE_RADIUS + 0.2
+
+# drone spawn box (kept inside the walls / off the floor & ceiling)
+SPAWN_HALF_X = WORLD_X - 1.0           # x in [-9, 9]
+SPAWN_Y_MIN, SPAWN_Y_MAX = 1.0, WORLD_Y - 1.0   # y in [1, 19]
+
+# ------------------------------------------------------------------ #
+# curriculum: rotate the target off the collinear (drone->center->target)
+# line. Large angle early = obstacle out of the path (easy); 0 late =
+# collinear (hard). Difficulty steps down in N_STAGES discrete stages
+# across the whole training run.
+#   band each stage: angle magnitude ~ U[angle_lo, ANGLE_START]
+#     - angle_lo starts at ANGLE_START (all easy) and steps down to 0
+#     - upper edge stays ANGLE_START, so easy geometries are always in the
+#       mix (prevents forgetting / keeps a general policy)
+# ------------------------------------------------------------------ #
+ANGLE_START = math.pi / 4              # 90deg: straight path fully clears the obstacle
+N_STAGES = 5
+#RAMP_FRAC = 0.5 #0.2 #0.5 #1 # 0.4
+RAMP_ITERS = 500
+
+R0_SCALER = 1e-3
+
+
+class VecDrone2D:
+    def __init__(self, num_envs, device, cfg=None, subtract_r1_from_r0=False, r1_multiplier=1, perturb=0, beta=5e-2, k=0.5, total_iters=1000, use_curriculum=True, difficulty_if_no_curr=1.0, num_steps_per_env=24):
+        # --- required VecEnv attributes ---
+        self.num_envs = num_envs
+        self.num_actions = 2                       # [thrust, moment]
+        self.device = torch.device(device)
+        self.cfg = cfg or {}
+        self.max_episode_length = 400             # control steps per episode
+        self.episode_length_buf = torch.zeros(
+            num_envs, dtype=torch.long, device=self.device)
+
+        # --- physics params ---
+        self.m, self.J, self.g = 1.0, 0.5, 9.81
+        self.dt = 1e-3                             # physics step
+        self.decimation = 20                      # physics steps per control step
+        self.hover = self.m * self.g
+
+        self.TARGET_RADIUS_SQ = TARGET_RADIUS**2
+        self.OBSTACLE_RADIUS_SQ = OBSTACLE_RADIUS**2
+        self.UNSAFE_REGION_OBSTACLE_RADIUS = UNSAFE_REGION_OBSTACLE_RADIUS
+        self.UNSAFE_REGION_OBSTACLE_RADIUS_SQUARED = UNSAFE_REGION_OBSTACLE_RADIUS**2
+        self.beta = beta
+        self.k = k
+        self.subtract_r1_from_r0 = subtract_r1_from_r0
+        self.r1_multiplier = r1_multiplier # this is only applicable when r1 is subtracted from r0
+        self.perturb = perturb
+        # 2026-09-19: optionally keep the episode running after the drone enters the obstacle disc
+        # (runner.terminate_on_obstacle: false). Contact then only shows up through r1 (and the
+        # per-episode Episode/ep_hit_obstacle rate below); the drone passes straight through the disc.
+        self.terminate_on_obstacle = True
+        # 2026-09-19: r1 inside the unsafe set. Default 1 - beta (the original); runner.unsafe_cost overrides
+        # (e.g. 10) to make brief passes through the disc much more expensive for the V1 constraint.
+        self.unsafe_cost = 1.0 - beta
+        # 2026-09-25: separate flat cost inside the wall / floor bands (r1_walls / r1_floor). None = same as
+        # unsafe_cost. Set higher (e.g. 3) to make the boundary bands more expensive than the obstacle disc.
+        self.band_unsafe_cost = None
+        # 2026-09-24: optionally charge the unsafe-set cost per unit PATH LENGTH instead of per step (step mode
+        # only): r1 = unsafe_cost * |v| / unsafe_speed_ref inside the set, so a crossing costs the same whatever
+        # the speed (a fast dash through the disc no longer buys a smaller cumulative r1). None = per step (the
+        # original). unsafe_speed_ref is the speed at which the two agree; set from the RL-SGF exp16 policy's
+        # transit speed (mean 4.0 m/s when > 0.5 m from the target) so a straight crossing costs what it cost
+        # RL-SGF (0.95 x 1.3 m / (4 m/s x 0.02 s) ~ 15.4 undiscounted). Loitering inside the set is ~free.
+        self.unsafe_speed_ref = None
+        self.hit_obstacle_ep = torch.zeros(num_envs, dtype=torch.bool, device=self.device)  # hit at least once this episode
+        # 2026-09-20: r1_mode "episode" charges the safety cost ONCE per episode, at the first entry into the
+        # unsafe set, and pays a credit of -collision_budget once, on the FIRST step of the episode:
+        #     r1_t = -collision_budget (t = 1)   + 1 (at the first unsafe-set entry of the episode)
+        # so the UNDISCOUNTED episode return is 1{entered unsafe set} - collision_budget for EVERY episode,
+        # whatever its length, and
+        #     V1 <= 0  <=>  P(episode enters the unsafe set) <= collision_budget.
+        # (2026-09-21: the credit used to be spread as -collision_budget/T per step; an episode that ends early by
+        # crash / out-of-bounds then only collected len/T of it, so the effective budget was
+        # collision_budget * E[len]/T and V1 was pinned at 0 for ~3000 iterations while 85 % of episodes went
+        # out of bounds (exp31). r1_credit "step" keeps that variant for reproduction.)
+        # This is the constraint on the per-episode collision rate (Episode/ep_hit_obstacle counts the disc,
+        # a subset of the unsafe set); the default "step" mode (-beta ... / unsafe_cost per step) is a budget
+        # on unsafe STEPS, which 30 % of episodes brushing the disc for a few steps each satisfies.
+        # Use an undiscounted r1 channel (gamma1 = 1) with this mode; discounting lets late hits through.
+        self.r1_mode = "step"
+        self.r1_credit = "start"   # "start": -collision_budget at t = 1; "step": -collision_budget/T every step
+        self.collision_budget = beta
+        self.unsafe_ep = torch.zeros(num_envs, dtype=torch.bool, device=self.device)  # entered unsafe set this episode
+        # 2026-09-22: optionally treat the world boundary like the obstacle. With r1_walls the unsafe set is the
+        # union of the obstacle disc (1.3 r) and a band of width wall_margin inside the world box (both side walls,
+        # the ceiling and the floor); everything the obstacle gets (first-entry event in episode mode, the shaped
+        # exp(-k d) cost in step mode via d = min(obstacle distance, wall distance)) applies to the union. Without
+        # it, leaving the box is invisible to r1, so "fly out of bounds" is a perfectly safe policy (exp38/39).
+        self.r1_walls = False
+        self.wall_margin = 0.5
+        self.terminate_on_oob = True   # False: leaving the world box is not an episode end (use with r1_walls)
+        self.terminate_on_crash = True  # False: floor contact (y <= 0) is not an episode end either
+        self.wall_ep = torch.zeros(num_envs, dtype=torch.bool, device=self.device)  # entered the wall band this episode
+        # 2026-09-25: floor-only variant of r1_walls. With r1_floor the unsafe set is the union of the obstacle disc
+        # and the band y < floor_margin above the floor (side walls / ceiling untouched); same union semantics as
+        # r1_walls (shaped exp(-k d) cost via d = min(obstacle distance, y - floor_margin), first-entry event in
+        # episode mode). Meant for terminate_on_oob false + terminate_on_crash true: leaving the box is r0's
+        # business, while the approach to the (terminal, r1-free) floor is charged by V1 -- the 2D analogue of the
+        # Isaac Lab low_altitude term, placed in r1 instead of r0 (exp68). Composable with r1_walls (min of both).
+        self.r1_floor = False
+        self.floor_margin = 1.0
+        self.floor_ep = torch.zeros(num_envs, dtype=torch.bool, device=self.device)  # entered the floor band this episode
+
+        self.prev_action = torch.zeros(num_envs, self.num_actions, device=self.device)
+
+        self.ACTION_HIST = 10
+        self.action_hist = torch.zeros(num_envs, self.ACTION_HIST, self.num_actions, device=self.device)
+        self.VAR_COEF = 5.0    # tune
+
+        # --- curriculum state ---
+        self.total_iters = max(1, int(total_iters))
+        self.iters_per_stage = self.total_iters / N_STAGES
+        self.global_step = 0
+        self.angle_lo = ANGLE_START            # lower edge of the angle band (starts easy)
+        self.use_curriculum = use_curriculum
+        self.num_steps_per_env = num_steps_per_env
+
+        initial_difficulty = 0.0 if use_curriculum else difficulty_if_no_curr
+        self._set_difficulty(initial_difficulty)
+
+        # --- action scaling: raw policy output (~[-1,1]) -> F, M ---
+        self.thrust_scale = self.hover
+        self.moment_scale = 2.0
+
+        # --- target / obstacle buffers ---
+        self.target = torch.zeros(num_envs, 2, device=self.device)
+        self.obstacle = torch.zeros(num_envs, 2, device=self.device)
+
+        # --- state: [x, y, theta, vx, vy, omega], shape (num_envs, 6) ---
+        self.state = torch.zeros(num_envs, 6, device=self.device)
+        self.reset_idx(torch.arange(num_envs, device=self.device))
+
+        # compile the physics hot path for kernel fusion — GPU only
+        if self.device.type != "cpu":
+            self._integrate = torch.compile(self._integrate)
+            self._reward   = torch.compile(self._reward)
+            self.r1_reward = torch.compile(self.r1_reward)
+
+        # # compile the physics hot path for kernel fusion
+        # self._integrate = torch.compile(self._integrate)
+        # #self._integrate = torch.compile(self._integrate, mode="reduce-overhead")
+        # self._reward   = torch.compile(self._reward)
+        # self.r1_reward = torch.compile(self.r1_reward)
+
+    def _set_difficulty(self, difficulty: float):
+        difficulty = max(0.0, min(1.0, float(difficulty)))
+
+        self.difficulty = difficulty
+
+        # Only used as a readable/loggable stage index.
+        self.curriculum_stage = min(
+            N_STAGES - 1,
+            int(difficulty * N_STAGES),
+        )
+
+        # difficulty = 0:
+        #     angle_lo = ANGLE_START
+        #     only easy ±ANGLE_START geometry
+        #
+        # difficulty = 1:
+        #     angle_lo = 0
+        #     full final range [0, ANGLE_START]
+        self.angle_lo = ANGLE_START * (1.0 - difficulty)
+
+    # ------------------------------------------------------------------ #
+    # curriculum: advance the discrete difficulty stage from the (approximate)
+    # current iteration, inferred from the global control-step counter.
+    # one iteration collects ~max_episode_length steps per env.
+    # ------------------------------------------------------------------ #
+
+    def _update_curriculum(self):
+        if not self.use_curriculum:
+            return
+        iteration = self.global_step / self.num_steps_per_env
+        progress = min(iteration / RAMP_ITERS, 1.0)   # fixed # of iters to reach full difficulty
+        self._set_difficulty(progress)
+
+    # ------------------------------------------------------------------ #
+    # required: get_observations  ->  TensorDict with the groups your
+    # config1.yaml references ("policy" for actor, "+privileged" for critic)
+    # ------------------------------------------------------------------ #
+    def get_observations(self):
+        x, y, th, vx, vy, w = self.state.unbind(dim=1)
+        ex, ey = x - self.target[:, 0], y - self.target[:, 1]
+
+        # Normalization
+        ex = ex / (WORLD_X*2)
+        ey = ey / WORLD_Y
+        # th = th / 5
+        vx = vx / 5
+        vy = vy / 5
+        w = w / 5
+
+        # signed clearance to each boundary, normalized like the other position obs
+        d_left   = (x - (-WORLD_X)) / (WORLD_X * 2)     # dist to left wall  x=-10
+        d_right  = (WORLD_X - x)    / (WORLD_X * 2)     # dist to right wall x=+10
+        d_floor  = y / WORLD_Y                          # dist to floor      y=0
+        d_ceil   = (WORLD_Y - y) / WORLD_Y              # dist to ceiling    y=20
+
+        pa0 = self.prev_action[:, 0]
+        pa1 = self.prev_action[:, 1]
+
+        ox = (self.obstacle[:, 0] - x) / (WORLD_X*2)
+        oy = (self.obstacle[:, 1] - y) / WORLD_Y
+
+        # actor sees this. sin/cos instead of raw theta (no wrap discontinuity)
+        #policy = torch.stack([ex, ey, torch.sin(th), torch.cos(th), vx, vy, w,
+        #pa0, pa1, ox, oy], dim=1)
+
+        policy = torch.stack([ex, ey, torch.sin(th), torch.cos(th), vx, vy, w,
+                              pa0, pa1, ox, oy,
+                              d_left, d_right, d_floor, d_ceil], dim=1)
+
+        # <-- inject observation noise here to emulate a real state estimator
+
+        # critic-only privileged info (clean, plus any hidden params)
+        privileged = torch.stack([th, self.m * torch.ones_like(th)], dim=1)
+
+        return TensorDict(
+            {"policy": policy, "privileged": privileged},
+            batch_size=[self.num_envs],
+        )
+
+    # ------------------------------------------------------------------ #
+    # required: step
+    # ------------------------------------------------------------------ #
+    def step(self, actions):
+        actions = actions.to(self.device).clamp(-1.0, 1.0)
+        F = (self.hover + actions[:, 0] * self.thrust_scale).clamp(min=0.0)
+        M = actions[:, 1] * self.moment_scale
+
+        # integrate physics with zero-order hold on (F, M) across substeps
+        for _ in range(self.decimation):
+            self._integrate(F, M)
+
+        self.episode_length_buf += 1
+        self.global_step += 1
+        self._update_curriculum()
+
+        crashed, out_of_bounds, hit_obstacle = self._terminated()
+        terminated = torch.zeros_like(crashed)
+        if self.terminate_on_crash:
+            terminated = terminated | crashed
+        if self.terminate_on_oob:
+            terminated = terminated | out_of_bounds
+        if self.terminate_on_obstacle:
+            terminated = terminated | hit_obstacle
+        self.hit_obstacle_ep |= hit_obstacle
+        timed_out = self.episode_length_buf >= self.max_episode_length
+        dones = terminated | timed_out
+
+        # per-step unsafe fraction (inside the unsafe region = the set C that r1 penalizes)
+        obst_d2 = (self.state[:, 0] - self.obstacle[:, 0]) ** 2 \
+                + (self.state[:, 1] - self.obstacle[:, 1]) ** 2
+        unsafe_now = obst_d2 < self.UNSAFE_REGION_OBSTACLE_RADIUS_SQUARED
+
+        # --- update action history + variance (uncompiled, stateful) ---
+        self.action_hist = torch.roll(self.action_hist, shifts=-1, dims=1)
+        self.action_hist[:, -1] = actions
+        action_var = self.action_hist.var(dim=1).sum(dim=1)          # (N,)
+
+        r0 = self._reward(actions)
+        r0 = r0 - self.VAR_COEF * action_var * R0_SCALER            # <-- add penalty here
+        r1 = self.r1_reward(actions)
+
+        # should make r1 penalties continuous probably
+        #r0 = self._reward(actions)
+        #r1 = self.r1_reward(actions)
+
+        #r1 = FAILURE_PENALTY * terminated.float()
+        if self.subtract_r1_from_r0:
+            r0 -= r1 * self.r1_multiplier
+        rewards = r0
+        # r1 is included in extras
+
+        self.prev_action = actions.clone()
+
+        # auto-reset finished envs -- rsl_rl expects the POST-reset observation
+        reset_ids = dones.nonzero(as_tuple=False).flatten()
+        hit_obstacle_ep_ended = self.hit_obstacle_ep[reset_ids].float()   # snapshot: reset_idx clears the flag
+        unsafe_ep_ended = self.unsafe_ep[reset_ids].float()
+        wall_ep_ended = self.wall_ep[reset_ids].float()
+        floor_ep_ended = self.floor_ep[reset_ids].float()
+        if reset_ids.numel() > 0:
+            self.reset_idx(reset_ids)
+
+        obs = self.get_observations()
+        extras = {
+            "time_outs": timed_out,
+            "r1": r1,                      # keep this: the ALGORITHM consumes it (per-env, needed for V1)
+            "episode": {
+                "difficulty": torch.tensor(self.difficulty, device=self.device),
+                "curriculum_angle_lo": torch.tensor(self.angle_lo, device=self.device),
+                "r1_mean": r1.mean(),      # scalar: mean safety cost across envs, for logging
+                "frac_steps_unsafe": unsafe_now.float().mean(),
+                "frac_steps_term_obstacle": hit_obstacle.float().mean(),
+                "frac_steps_term_crashed": crashed.float().mean(),
+                "frac_steps_term_oob": out_of_bounds.float().mean(),
+            },
+        }
+        # --- PER-EPISODE termination rates (2026-09-12) ---
+        # The frac_steps_* above are per-STEP fractions (mean of a boolean over all envs at one
+        # step, then averaged over the rollout by rsl_rl), NOT the share of episodes that ended a
+        # given way. rsl_rl's logger concatenates every step's tensor for a key and takes ONE mean
+        # over the concatenation, so emitting a tensor with one 0/1 entry PER EPISODE THAT ENDED
+        # THIS STEP makes the logged value exactly  (#episodes ended by <cause>) / (#episodes ended)
+        # over the rollout -- the same quantity IsaacLab logs as Episode_Termination/<cause>.
+        # Only natural episode ends (this step's `dones`) count; the runner's forced reset after an
+        # update goes through reset() and is not an episode end. Keys are omitted on steps with no
+        # episode end (the logger skips missing keys), so they never dilute the mean.
+        if reset_ids.numel() > 0:
+            ep = extras["episode"]
+            ep["ep_term_obstacle"] = hit_obstacle[reset_ids].float()   # ended by hitting the obstacle
+            ep["ep_term_crashed"] = crashed[reset_ids].float()         # ended by hitting the floor
+            ep["ep_term_oob"] = out_of_bounds[reset_ids].float()       # ended by leaving the world box
+            ep["ep_term_any"] = terminated[reset_ids].float()          # ended by ANY termination (1 - timeout)
+            ep["ep_timeout"] = (timed_out & ~terminated)[reset_ids].float()  # survived the full episode
+            # 1 if the drone was inside the obstacle disc at ANY step of the episode. Equals ep_term_obstacle
+            # when obstacle contact terminates; it is the meaningful collision rate when it does not.
+            ep["ep_hit_obstacle"] = hit_obstacle_ep_ended
+            # 1 if the drone entered the UNSAFE SET (1.3 x obstacle radius) at any step; what r1_mode "episode"
+            # bounds by collision_budget. Only tracked in that mode (stays 0 otherwise).
+            ep["ep_unsafe_entry"] = unsafe_ep_ended
+            # 1 if the drone entered the wall band (r1_walls) at any step; part of ep_unsafe_entry when enabled.
+            ep["ep_wall_entry"] = wall_ep_ended
+            # 1 if the drone entered the floor band (r1_floor) at any step; part of ep_unsafe_entry when enabled.
+            ep["ep_floor_entry"] = floor_ep_ended
+        # Emitted EVERY step (scalar): logged mean x num_steps_per_env = #episodes behind the rates above.
+        extras["episode"]["ep_ends_per_step"] = torch.tensor(float(reset_ids.numel()), device=self.device)
+        return obs, rewards, dones, extras
+
+    # ------------------------------------------------------------------ #
+    # internals
+    # ------------------------------------------------------------------ #
+    def _integrate(self, F, M):
+        x, y, th, vx, vy, w = self.state.unbind(dim=1)
+
+        ax = (1.0 / self.m) * torch.sin(th) * F
+        ay = (1.0 / self.m) * torch.cos(th) * F - self.g
+        alpha = -M / self.J
+
+        vx, vy, w = vx + self.dt * ax, vy + self.dt * ay, w + self.dt * alpha   # velocities first
+        x, y, th = x + self.dt * vx, y + self.dt * vy, th + self.dt * w          # then positions
+
+        below = y < 0.0                            # ground clamp
+        y = torch.where(below, torch.zeros_like(y), y)
+        vy = torch.where(below, torch.zeros_like(vy), vy)
+
+        self.state = torch.stack([x, y, th, vx, vy, w], dim=1)
+
+    def try_reward(self, actions):
+        x, y, th, vx, vy, w = self.state.unbind(dim=1)
+
+        pos_err_sq = (
+            (x - self.target[:, 0]) ** 2
+            + (y - self.target[:, 1]) ** 2
+        )
+        dist = torch.sqrt(pos_err_sq + 1e-8)
+
+        speed_sq = vx**2 + vy**2
+        action_rate = ((actions - self.prev_action) ** 2).sum(dim=1)
+
+        near_target = torch.exp(-dist / 0.25)
+
+        reward = (
+            - 3.0 * dist
+            + 20.0 * near_target
+            - 1.0 * speed_sq
+            - 0.5 * w**2
+            - 0.25 * action_rate
+            - 2.0 * near_target * speed_sq
+        )
+
+        return reward * R0_SCALER
+
+
+    def _reward(self, actions):
+        x, y, th, vx, vy, w = self.state.unbind(dim=1)
+        pos_err = (x - self.target[:, 0]) ** 2 + (y - self.target[:, 1]) ** 2
+        close = pos_err < self.TARGET_RADIUS_SQ
+        rate = ((actions - self.prev_action) ** 2).sum(dim=1)
+        linear_pos_err = torch.sqrt(pos_err)
+
+        thrust = actions[:, 0]
+        moment = actions[:, 1]
+
+        return (
+            + 0.1 * (28**2-pos_err)
+            + 3 * (28-linear_pos_err)
+            #+ close.float() * TARGET_BONUS
+            - 4 * thrust ** 2 # PPO wants, was 3 before
+            - 4 * moment ** 2 # PPO wants, was 3 before
+            - 6 * rate
+            - 3 * w ** 2 # was 0.5 before #PPO wants
+            - 1.0 * (vx ** 2 + vy ** 2) # was 0.5 before
+            #- 1.0 * (1.0 - torch.cos(th))
+            #+ 3 * (20-linear_pos_err)
+            + TARGET_BONUS*torch.exp(-linear_pos_err / TARGET_DIS_SCALE)
+        ) * R0_SCALER
+
+    def r1_reward(self, actions):
+        x, y, th, vx, vy, w = self.state.unbind(dim=1)
+        obst_d = torch.sqrt((x - self.obstacle[:, 0]) ** 2 + (y - self.obstacle[:, 1]) ** 2) - UNSAFE_REGION_OBSTACLE_RADIUS
+        band_d = None   # signed distance to the wall/floor bands (None: no bands)
+        if self.r1_walls:
+            # signed distance to the wall band (positive inside the safe interior); the unsafe set is the union
+            m = self.wall_margin
+            wall_d = torch.minimum(torch.minimum(WORLD_X - m - x.abs(), WORLD_Y - m - y), y - m)
+            self.wall_ep |= wall_d < 0
+            band_d = wall_d
+        if self.r1_floor:
+            floor_d = y - self.floor_margin   # signed distance to the floor band (positive above it)
+            self.floor_ep |= floor_d < 0
+            band_d = floor_d if band_d is None else torch.minimum(band_d, floor_d)
+        if band_d is not None:
+            obst_d = torch.minimum(obst_d, band_d)
+        in_safe_set = obst_d >= 0
+
+        if self.r1_mode == "episode":
+            unsafe_now = ~in_safe_set
+            first_entry = unsafe_now & ~self.unsafe_ep
+            self.unsafe_ep |= unsafe_now
+            if self.r1_credit == "start":
+                # episode_length_buf was already incremented in step(): 1 on the first step after a reset
+                credit = (self.episode_length_buf == 1).float() * self.collision_budget
+            else:
+                credit = self.collision_budget / self.max_episode_length
+            return first_entry.float() - credit
+
+        safe_cost   = self.beta * (torch.exp(-obst_d * self.k) - 1.0)
+        if self.unsafe_speed_ref is None:
+            unsafe_cost = torch.full_like(obst_d, self.unsafe_cost)
+        else:
+            unsafe_cost = self.unsafe_cost * torch.sqrt(vx ** 2 + vy ** 2) / self.unsafe_speed_ref
+        if band_d is not None and self.band_unsafe_cost is not None:
+            # inside a wall/floor band the flat cost is band_unsafe_cost (per step; not speed-scaled)
+            unsafe_cost = torch.where(band_d < 0, torch.full_like(unsafe_cost, self.band_unsafe_cost), unsafe_cost)
+        return torch.where(in_safe_set, safe_cost, unsafe_cost)
+
+    def _terminated(self):
+        x, y, th, vx, vy, w = self.state.unbind(dim=1)
+        crashed = y <= 0.0
+        out_of_bounds = (x.abs() > WORLD_X) | (y > WORLD_Y)
+        obst_d2 = (x - self.obstacle[:, 0]) ** 2 + (y - self.obstacle[:, 1]) ** 2
+        hit_obstacle = obst_d2 < self.OBSTACLE_RADIUS_SQ
+        #tipped = th.abs() > (math.pi / 2)
+        self._term_obstacle = hit_obstacle          # <-- add: stash for logging
+        return crashed, out_of_bounds, hit_obstacle #| tipped
+
+    # ------------------------------------------------------------------ #
+    # spawn / reset
+    # ------------------------------------------------------------------ #
+    def reset_idx(self, ids):
+        n = ids.numel()
+
+        # obstacle nominal center (same for every env), as an (n, 2) tensor
+        cx = torch.full((n,), CENTER[0], device=self.device)
+        cy = torch.full((n,), CENTER[1], device=self.device)
+        center = torch.stack([cx, cy], dim=1)                      # (n, 2)
+
+        drone_xy  = torch.zeros(n, 2, device=self.device)
+        target_xy = torch.zeros(n, 2, device=self.device)
+        obst_xy   = torch.zeros(n, 2, device=self.device)
+
+        # retry loop: for envs that violate a margin, resample EVERYTHING
+        remaining = torch.ones(n, dtype=torch.bool, device=self.device)
+        for _ in range(100):
+            m = int(remaining.sum().item())
+            if m == 0:
+                break
+            idx = remaining.nonzero(as_tuple=False).flatten()      # (m,)
+
+            # obstacle: center + small jitter
+            o = center[idx] + OBSTACLE_SPAWN_STD * torch.randn(m, 2, device=self.device)
+
+            # drone: random on screen + small jitter
+            dx = SPAWN_HALF_X * 2 * (torch.rand(m, device=self.device) - 0.5)
+            dy = SPAWN_Y_MIN + (SPAWN_Y_MAX - SPAWN_Y_MIN) * torch.rand(m, device=self.device)
+            d = torch.stack([dx, dy], dim=1) + DRONE_SPAWN_STD * torch.randn(m, 2, device=self.device)
+
+            # target: opposite side of center from the drone, random distance from center,
+            # rotated off the collinear line by the curriculum angle
+            dir_vec = center[idx] - d                              # drone -> center
+            dir_norm = dir_vec / (dir_vec.norm(dim=1, keepdim=True) + 1e-8)
+
+            # curriculum angle: magnitude ~ U[angle_lo, ANGLE_START], random sign
+            ang_mag = self.angle_lo + (ANGLE_START - self.angle_lo) * torch.rand(m, device=self.device)
+            sign = torch.where(torch.rand(m, device=self.device) < 0.5,
+                               torch.ones(m, device=self.device),
+                               -torch.ones(m, device=self.device))
+            ang = ang_mag * sign
+            cos_a, sin_a = torch.cos(ang), torch.sin(ang)
+            rx = dir_norm[:, 0] * cos_a - dir_norm[:, 1] * sin_a
+            ry = dir_norm[:, 0] * sin_a + dir_norm[:, 1] * cos_a
+            dir_rot = torch.stack([rx, ry], dim=1)
+
+            dist = TARGET_DIST_MIN + (TARGET_DIST_MAX - TARGET_DIST_MIN) * torch.rand(m, 1, device=self.device)
+            t = center[idx] + dir_rot * dist + TARGET_SPAWN_STD * torch.randn(m, 2, device=self.device)
+
+            # margins: drone and target must clear the obstacle; target must stay in-world
+            drone_ok  = ((d - o) ** 2).sum(dim=1) >= DRONE_MARGIN ** 2
+            target_ok = ((t - o) ** 2).sum(dim=1) >= TARGET_MARGIN ** 2
+            target_in = (t[:, 0].abs() <= WORLD_X) & (t[:, 1] >= 0.0) & (t[:, 1] <= WORLD_Y)
+            ok = drone_ok & target_ok & target_in
+
+            good = idx[ok]
+            drone_xy[good]  = d[ok]
+            target_xy[good] = t[ok]
+            obst_xy[good]   = o[ok]
+            remaining[good] = False
+
+        # fallback for any envs that never satisfied the constraints (should be
+        # ~never): put them somewhere safe rather than leaving them at (0,0),
+        # which would trigger `crashed` (y<=0) immediately.
+        if bool(remaining.any()):
+            fb = remaining.nonzero(as_tuple=False).flatten()
+            drone_xy[fb]  = torch.tensor([WORLD_X * 0.5, WORLD_Y * 0.5], device=self.device)
+            target_xy[fb] = torch.tensor([-WORLD_X * 0.5, WORLD_Y * 0.5], device=self.device)
+            obst_xy[fb]   = torch.tensor([CENTER[0], CENTER[1]], device=self.device)
+
+        # build the state for these envs
+        new = torch.zeros(n, 6, device=self.device)
+        new[:, 0:2] = drone_xy
+        new[:, 2]   = self.perturb * 2 * 0.3 * torch.randn(n, device=self.device)   # small tilt
+        new[:, 3:6] = self.perturb * 2 * 0.5 * torch.randn(n, 3, device=self.device) # small initial velocities
+
+        self.state[ids]    = new
+        self.target[ids]   = target_xy
+        self.obstacle[ids] = obst_xy
+
+        self.episode_length_buf[ids] = 0     # <-- ADD: reset the timeout counter
+        self.prev_action[ids] = 0.0          # <-- ADD: reset prev action
+        self.action_hist[ids] = 0.0        # <-- add here
+        self.hit_obstacle_ep[ids] = False
+        self.unsafe_ep[ids] = False
+        self.wall_ep[ids] = False
+        self.floor_ep[ids] = False
+
+    def reset(self):
+        self.episode_length_buf[:] = 0
+        self.reset_idx(torch.arange(self.num_envs, device=self.device))
+        return self.get_observations()
+
+    def stagger_episodes(self):
+        """Desynchronise the envs' episode clocks once, at training start.
+
+        With every termination disabled all envs time out together, so episodes start only every
+        max_episode_length steps and most rollout windows contain no episode start; the start-row
+        V1 estimate then has nothing to average. Drawing each env's initial timeout counter uniformly
+        in [0, max_episode_length) spreads the starts evenly over all windows (steady state:
+        num_envs * num_steps_per_env / max_episode_length starts per window). Only the very first
+        episode of each env is truncated."""
+        self.episode_length_buf[:] = torch.randint(
+            0, self.max_episode_length, (self.num_envs,), device=self.device)

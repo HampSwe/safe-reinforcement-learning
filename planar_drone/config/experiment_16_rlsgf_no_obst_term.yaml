@@ -1,0 +1,27 @@
+# RL-SGF, experiment_05 settings (T rollouts, reset after update, no bootstrap, 3 critic epochs), but the
+# episode is NOT terminated when the drone enters the obstacle disc (runner.terminate_on_obstacle: false,
+# 2026-09-19). Obstacle contact then enters only through the safety cost r1 (V1 constraint); the drone
+# passes through the disc. Collision rate to read: Episode/ep_hit_obstacle (hit at least once per episode).
+# 4000 iterations x 400 steps = 1.6 M env steps per env.
+runner:
+  num_steps_per_env: 0
+  num_steps_per_env_multiplier: 1
+  reset_after_update: true
+  terminate_on_obstacle: false
+  obs_groups: {"actor": ["policy"], "critic": ["policy", "privileged"]}
+  save_interval: 100
+  algorithm:
+    class_name: rsl_rl.algorithms.rl_sgf:RLSGF
+    bootstrap_final_state: false
+    critic_use_epochs: true
+    critic_epochs: 3
+    critic_minibatch: 131072
+  actor:
+    class_name: MLPModel
+    distribution_cfg:
+      class_name: GaussianDistribution
+      std_type: log
+      init_std: 1.0
+      std_range: [0.2, 2.0]
+  critic:
+    class_name: MLPModel

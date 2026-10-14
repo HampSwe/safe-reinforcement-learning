@@ -1,0 +1,38 @@
+# CPO (experiment_14 settings) on the NO-OBSTACLE-TERMINATION task with r1 = 10 inside the unsafe set
+# (experiment_19 counterpart, runner.unsafe_cost: 10, 2026-09-19). With the larger unsafe cost the mean per-step r1
+# can exceed cost_limit 0, so the CPO constraint may actually activate here (it never did at 0.95).
+# Collision rate: Episode/ep_hit_obstacle. Budget 24000 x 100 = 6000 x 400 env steps.
+runner:
+  num_steps_per_env: 100
+  curriculum_steps_per_env: 400
+  subtract_r1_from_r0: false
+  terminate_on_obstacle: false
+  unsafe_cost: 10.0
+  obs_groups: {"actor": ["policy"], "critic": ["policy", "privileged"]}
+  save_interval: 500
+  algorithm:
+    class_name: rsl_rl.algorithms.cpo:CPO
+    gamma: 0.99
+    lam: 0.95
+    cost_gamma: 0.99
+    cost_lam: 0.95
+    target_kl: 0.01
+    cg_iters: 15
+    cg_damping: 0.1
+    line_search_steps: 15
+    line_search_decay: 0.8
+    fvp_subsample: 5   # FVP on every 5th sample (baselines TRPO default); g, b, c, line search use the full batch
+    cost_limit: 0.0
+    critic_lr: 0.001
+    num_learning_epochs: 5
+    num_mini_batches: 4
+    max_grad_norm: 1.0
+  actor:
+    class_name: MLPModel
+    distribution_cfg:
+      class_name: GaussianDistribution
+      std_type: log
+      init_std: 1.0
+      std_range: [0.2, 2.0]
+  critic:
+    class_name: MLPModel

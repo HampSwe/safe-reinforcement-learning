@@ -1,0 +1,38 @@
+# experiment_58 = experiment_16 (RL-SGF, no obstacle termination, cumulative per-step r1) with the FIXED r1 model
+# (2026-09-24), the same change applied to SafePPO in experiment_59:
+#   * runner.unsafe_cost 0.95 -> 30. Measured on the exp16 and exp56 final policies (v1_decomp.py): the shaping drip
+#     outside the set is worth ~-3.3..-3.9 (discounted) per episode, and a crossing at 0.95/step costs only
+#     0.95 x ~2.4 discounted unsafe steps ~ 2.3, so 57 % (RL-SGF-style) / 79 % (PPO-style) of the CROSSING episodes
+#     still had V1 < 0 and mean V1 could not reach 0 below a ~100 % hit rate -- the constraint could never bind
+#     (V1 ~ -3.6 for all 6000 its of exp16). At 30 every crossing episode is V1-positive (+5..+15) and mean V1 = 0
+#     falls at ~5-8 % of episodes touching the set (50 -> ~3-5 %, 100 -> ~2 %).
+#   * runner.unsafe_speed_ref 4.0: the cost is charged per unit path length, r1 = 30 * |v| / 4 m/s inside the
+#     1.3 r disc (4 m/s = the exp16 policy's transit speed), so a fast dash through the disc costs the same as a
+#     slow one (straight crossing ~ 30 x 1.3 m / (4 m/s x 0.02 s) ~ 490 undiscounted).
+# Everything else identical to experiment_16 (T rollouts, reset after update, no bootstrap, 3 critic epochs).
+# Earlier unsafe_cost 30 without the path-length rule: experiment_21 / logs/exp20 (killed at ~750 its).
+# Collision rate to read: Episode/ep_hit_obstacle.
+runner:
+  num_steps_per_env: 0
+  num_steps_per_env_multiplier: 1
+  reset_after_update: true
+  terminate_on_obstacle: false
+  unsafe_cost: 30.0        # r1 inside the unsafe set (was 1 - beta = 0.95); see header
+  unsafe_speed_ref: 4.0    # ... charged per unit path length: 30 * |v| / 4 m/s
+  obs_groups: {"actor": ["policy"], "critic": ["policy", "privileged"]}
+  save_interval: 100
+  algorithm:
+    class_name: rsl_rl.algorithms.rl_sgf:RLSGF
+    bootstrap_final_state: false
+    critic_use_epochs: true
+    critic_epochs: 3
+    critic_minibatch: 131072
+  actor:
+    class_name: MLPModel
+    distribution_cfg:
+      class_name: GaussianDistribution
+      std_type: log
+      init_std: 1.0
+      std_range: [0.2, 2.0]
+  critic:
+    class_name: MLPModel

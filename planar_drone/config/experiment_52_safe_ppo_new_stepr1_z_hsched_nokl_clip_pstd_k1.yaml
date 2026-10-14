@@ -1,0 +1,74 @@
+# experiment_52 = experiment_51 (z = 20, sigma h schedule on, cumulative per-step r1, split-half, fixed PPO lr 3e-4,
+# KL halving off, max_theta_step 0.5, project_std true) with kappa 0.25 -> 1.0 (2026-09-24): the paper's L = 1/h, so
+# the g1 coefficient h/kappa drops from 4h to h. exp51 showed the unhalved safety step 4-8x PPO's own (raw 0.4-0.8 on
+# the ~5-10 % of iterations the constraint was active) with KL 9-125 per such step, each followed by an oob / crash
+# excursion; the 0.5 clip did not keep those survivable. kappa = 1 divides the safety step by 4 and leaves the clip as a
+# pure disaster guard.
+runner:
+  num_steps_per_env: 100
+  curriculum_steps_per_env: 400
+  subtract_r1_from_r0: false
+  terminate_on_obstacle: false
+  r1_mode: step
+  obs_groups: {"actor": ["policy"], "critic": ["policy", "privileged"]}
+  save_interval: 500
+  algorithm:
+    class_name: rsl_rl.algorithms.safe_ppo:SafePPO
+    # --- PPO task channel ---
+    num_learning_epochs: 5
+    num_mini_batches: 4
+    clip_param: 0.2
+    gamma: 0.99
+    lam: 0.95
+    value_loss_coef: 1.0
+    entropy_coef: 0.005
+    learning_rate: 3.0e-04
+    max_grad_norm: 1.0
+    use_clipped_value_loss: true
+    schedule: fixed
+    desired_kl: 0.01
+    normalize_advantage_per_mini_batch: false
+    # --- safe gradient flow (Lemma-3 QCQP) ---
+    h: 0.05
+    z: 20.0   # = 1/h_ref; g0 = -z dtheta_ppo
+    alpha: 1.0
+    eps: 1.0e-08
+    gamma1: 0.99
+    h_schedule: true
+    h_exp: 2.0
+    h_min: 1.0e-07
+    # --- safety channel ---
+    r1_scale: 1.0
+    dir_scale: 1.0
+    grad_v1_divide_by_T: true   # ignored with grad_v1_denom: episode
+    grad_v1_denom: episode
+    v1_estimate: start
+    split_half_norm: true
+    kappa_calibrate: false
+    kappa_fixed: 1.0   # paper L = 1/h
+    kappa_warmup: 300
+    kappa_cal_skip: 100
+    kappa_ema: 0.995
+    kappa_min: 0.01
+    kappa_max: 100.0
+    bootstrap_cost_returns: true
+    project_std: true   # std block under the QCQP + h z scaling (rl_sgf.py parity)
+    # --- cost critic (V1 baseline) ---
+    cost_critic_lr: 0.0003
+    cost_critic_epochs: 4
+    cost_critic_mini_batches: 4
+    cost_critic_max_grad_norm: 3.0
+    # --- trust region on the projected step ---
+    kl_budget: 0.08
+    kl_backoff_steps: 1   # halving off
+    max_theta_step: 0.5   # L2 clip on the whole applied step (rl_sgf.py parity), replaces the halving
+    memory_chunk_size: 50
+  actor:
+    class_name: MLPModel
+    distribution_cfg:
+      class_name: GaussianDistribution
+      std_type: log
+      init_std: 1.0
+      std_range: [0.2, 2.0]
+  critic:
+    class_name: MLPModel

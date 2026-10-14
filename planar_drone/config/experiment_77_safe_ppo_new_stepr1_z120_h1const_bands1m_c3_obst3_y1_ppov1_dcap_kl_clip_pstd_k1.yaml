@@ -1,0 +1,85 @@
+# experiment_77 = experiment_76 + grad_v1_mode ppo (2026-09-28): the V1 channel is a PPO-like step (same epochs/
+# minibatches/lr/clip as the task channel, own Adam per env half) instead of a raw score-function gradient; dir_scale 1.
+# experiment_72 = experiment_71 (SafePPO z 120, h_ref 0.1, y = dir_scale 0.01, r1_walls + r1_floor 1 m bands at flat r1 3,
+# oob + crash terminating, fixed PPO lr 3e-4, KL halving off, max_theta_step 0.5, project_std true, kappa 1) with the
+# obstacle disc ALSO at unsafe_cost 3 (was 0.95) (2026-09-26). Motivation: exp71 reached reward ~160 at full
+# difficulty but 18 % of episodes dash through the disc; the bands were 3x more expensive than the obstacle.
+runner:
+  num_steps_per_env: 100
+  curriculum_steps_per_env: 400
+  subtract_r1_from_r0: false
+  terminate_on_obstacle: false
+  terminate_on_oob: true      # exp71: leaving the box terminates again (exp68-70 flew out and stayed out)
+  terminate_on_crash: true    # floor contact resets
+  r1_walls: true              # exp71: 1 m band inside all four walls is part of the unsafe set
+  wall_margin: 1.0
+  unsafe_cost: 3.0            # exp72: flat r1 inside the obstacle disc (was the default 1 - beta = 0.95)
+  band_unsafe_cost: 3.0       # exp71: flat r1 inside the wall/floor bands
+  r1_floor: true              # exp68: the band y < floor_margin joins the unsafe set (redundant with r1_walls at 1 m; kept)
+  floor_margin: 1.0
+  r1_mode: step
+  obs_groups: {"actor": ["policy"], "critic": ["policy", "privileged"]}
+  save_interval: 500
+  algorithm:
+    class_name: rsl_rl.algorithms.safe_ppo:SafePPO
+    # --- PPO task channel ---
+    num_learning_epochs: 5
+    num_mini_batches: 4
+    clip_param: 0.2
+    gamma: 0.99
+    lam: 0.95
+    value_loss_coef: 1.0
+    entropy_coef: 0.005
+    learning_rate: 3.0e-04
+    max_grad_norm: 1.0
+    use_clipped_value_loss: true
+    schedule: fixed
+    desired_kl: 0.01
+    normalize_advantage_per_mini_batch: false
+    # --- safe gradient flow (Lemma-3 QCQP) ---
+    h: 0.1   # h_ref (exp69: 0.01, exp64: 0.008); task_gain = h z starts at 12
+    z: 120.0   # exp54: 200; |g0| = z |dtheta_ppo|
+    alpha: 1.0
+    eps: 1.0e-08
+    gamma1: 0.99
+    h_schedule: false   # exp75: constant h = h_ref (was h_ref (sigma/sigma_ref)^2, pinned at 0.004 once std hit the 0.2 floor)
+    h_exp: 2.0
+    h_min: 1.0e-07
+    # --- safety channel ---
+    r1_scale: 1.0
+    dir_scale: 1.0   # exp77: g1 is now a z1-scaled PPO displacement like g0 -> same units, no 0.01 fudge
+    grad_v1_divide_by_T: true   # ignored with grad_v1_denom: episode
+    grad_v1_denom: episode
+    v1_estimate: start
+    split_half_norm: true
+    degenerate_cap: true
+    grad_v1_mode: ppo   # exp77: V1 direction = -z1 x (clipped-surrogate PPO update on the cost advantage), per env half
+    z1: 120.0           # = z, so |g1| and |g0| are both z x |Adam displacement|
+    kappa_calibrate: false
+    kappa_fixed: 1.0   # paper L = 1/h
+    kappa_warmup: 300
+    kappa_cal_skip: 100
+    kappa_ema: 0.995
+    kappa_min: 0.01
+    kappa_max: 100.0
+    bootstrap_cost_returns: true
+    project_std: true   # std block under the QCQP + h z scaling (rl_sgf.py parity)
+    # --- cost critic (V1 baseline) ---
+    cost_critic_lr: 0.0003
+    cost_critic_epochs: 4
+    cost_critic_mini_batches: 4
+    cost_critic_max_grad_norm: 3.0
+    # --- trust region on the projected step ---
+    kl_budget: 0.08
+    kl_backoff_steps: 5   # exp76: KL halving ON (projected step halved up to 5x until KL <= kl_budget 0.08)
+    max_theta_step: 0.5   # L2 clip on the whole applied step (rl_sgf.py parity), replaces the halving
+    memory_chunk_size: 50
+  actor:
+    class_name: MLPModel
+    distribution_cfg:
+      class_name: GaussianDistribution
+      std_type: log
+      init_std: 1.0
+      std_range: [0.2, 2.0]
+  critic:
+    class_name: MLPModel

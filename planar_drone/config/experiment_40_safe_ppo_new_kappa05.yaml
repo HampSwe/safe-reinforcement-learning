@@ -1,0 +1,73 @@
+# experiment_40 = experiment_38 (new SafePPO: per-episode r1 credit at start, V1 from start rows, grad V1 per episode,
+# split-half |grad V1|^2, spe 100) with FIXED kappa = 0.5 instead of 0.25 (2026-09-22). exp38/39 (kappa 0.25) held
+# V1 <= 0 (2-3 % entries) but collapsed into the out-of-bounds policy (reward ~5): the safety step at h/kappa = 0.2
+# is half sampling noise and the KL backoff throttled every update. kappa 0.5 halves the safety step (h/kappa = 0.1).
+# 1-hour probe: 4200 iterations (~0.86 s/it), compared against exp38 at the same iteration.
+runner:
+  num_steps_per_env: 100
+  curriculum_steps_per_env: 400
+  subtract_r1_from_r0: false
+  terminate_on_obstacle: false
+  r1_mode: episode
+  r1_credit: start
+  collision_budget: 0.05
+  obs_groups: {"actor": ["policy"], "critic": ["policy", "privileged"]}
+  save_interval: 500
+  algorithm:
+    class_name: rsl_rl.algorithms.safe_ppo:SafePPO
+    # --- PPO task channel ---
+    num_learning_epochs: 5
+    num_mini_batches: 4
+    clip_param: 0.2
+    gamma: 0.99
+    lam: 0.95
+    value_loss_coef: 1.0
+    entropy_coef: 0.005
+    learning_rate: 0.0001
+    max_grad_norm: 1.0
+    use_clipped_value_loss: true
+    schedule: adaptive
+    desired_kl: 0.01
+    normalize_advantage_per_mini_batch: false
+    # --- safe gradient flow (Lemma-3 QCQP) ---
+    h: 0.05
+    alpha: 1.0
+    eps: 1.0e-08
+    gamma1: 1.0
+    h_schedule: false
+    h_exp: 2.0
+    h_min: 1.0e-07
+    # --- safety channel ---
+    r1_scale: 1.0
+    dir_scale: 1.0
+    grad_v1_divide_by_T: true   # ignored with grad_v1_denom: episode
+    grad_v1_denom: episode
+    v1_estimate: start
+    split_half_norm: true
+    kappa_calibrate: false
+    kappa_fixed: 0.5
+    kappa_warmup: 300
+    kappa_cal_skip: 100
+    kappa_ema: 0.995
+    kappa_min: 0.01
+    kappa_max: 100.0
+    bootstrap_cost_returns: true
+    project_std: false
+    # --- cost critic (V1 baseline) ---
+    cost_critic_lr: 0.0003
+    cost_critic_epochs: 4
+    cost_critic_mini_batches: 4
+    cost_critic_max_grad_norm: 3.0
+    # --- trust region on the projected step ---
+    kl_budget: 0.08
+    kl_backoff_steps: 5
+    memory_chunk_size: 50
+  actor:
+    class_name: MLPModel
+    distribution_cfg:
+      class_name: GaussianDistribution
+      std_type: log
+      init_std: 1.0
+      std_range: [0.2, 2.0]
+  critic:
+    class_name: MLPModel

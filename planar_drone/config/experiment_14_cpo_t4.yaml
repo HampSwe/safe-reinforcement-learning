@@ -1,0 +1,42 @@
+# CPO baseline (Achiam et al. 2017) for the T / reset / no-bootstrap RL-SGF runs, 2026-09-14.
+# Port of the Isaac Drone Racer CPO (cpo_isaac_drone_2026-09-14.zip, CPO_DESIGN.md) to the rsl_rl fork:
+# rsl_rl/algorithms/cpo.py. Everything except the policy update is IDENTICAL to the pure-PPO baseline
+# (experiment_13): 2048 envs, T/4 = 100-step continuing rollouts, GAE(0.99, 0.95), critic 5 epochs x
+# 4 minibatches, same actor std settings, curriculum pinned to 400 env steps/iter, and the same env-step
+# budget as the 7500-iteration RL-SGF runs: 30000 x 100 = 7500 x 400.
+# - Reward channel: r0 only (subtract_r1_from_r0: false) -- the cost is handled by the constraint.
+# - Cost channel: the env's r1 (same signal RL-SGF constrains); constraint = mean per-step r1 <= cost_limit,
+#   cost_limit 0 == RL-SGF's V1 <= 0 (E[#unsafe steps] <= beta*T). Per CPO_DESIGN.md s7 this constraint
+#   was nearly inert on the Isaac task; kept identical here on purpose so the comparison measures the algorithm.
+runner:
+  num_steps_per_env: 100
+  curriculum_steps_per_env: 400
+  subtract_r1_from_r0: false
+  obs_groups: {"actor": ["policy"], "critic": ["policy", "privileged"]}
+  save_interval: 500
+  algorithm:
+    class_name: rsl_rl.algorithms.cpo:CPO
+    gamma: 0.99
+    lam: 0.95
+    cost_gamma: 0.99
+    cost_lam: 0.95
+    target_kl: 0.01
+    cg_iters: 15
+    cg_damping: 0.1
+    line_search_steps: 15
+    line_search_decay: 0.8
+    fvp_subsample: 5   # FVP on every 5th sample (baselines TRPO default); g, b, c, line search use the full batch
+    cost_limit: 0.0
+    critic_lr: 0.001
+    num_learning_epochs: 5
+    num_mini_batches: 4
+    max_grad_norm: 1.0
+  actor:
+    class_name: MLPModel
+    distribution_cfg:
+      class_name: GaussianDistribution
+      std_type: log
+      init_std: 1.0
+      std_range: [0.2, 2.0]
+  critic:
+    class_name: MLPModel

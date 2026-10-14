@@ -1,0 +1,39 @@
+# Pure PPO (experiment_13 settings) on the NO-OBSTACLE-TERMINATION task (experiment_16 counterpart), 2026-09-19.
+# - runner.terminate_on_obstacle: false -> obstacle contact never ends the episode and r1 is not subtracted,
+#   so the obstacle is INVISIBLE to PPO here (only floor/out-of-bounds terminations remain). Collision rate
+#   to read: Episode/ep_hit_obstacle. Same env-step budget as the 4000-iteration RL-SGF run: 16000 x 100.
+# - curriculum_steps_per_env: 400 keeps the difficulty schedule identical to the T runs in env steps
+#   (the env counts "iterations" as global_step / num_steps_per_env).
+# - Standard continuing PPO rollouts (no reset after update), bootstrapped by the critic.
+# - Actor std settings identical to experiment_05.
+runner:
+  num_steps_per_env: 100
+  curriculum_steps_per_env: 400
+  subtract_r1_from_r0: false
+  terminate_on_obstacle: false
+  obs_groups: {"actor": ["policy"], "critic": ["policy", "privileged"]}
+  save_interval: 500
+  algorithm:
+    class_name: PPO
+    num_learning_epochs: 5
+    num_mini_batches: 4
+    clip_param: 0.2
+    gamma: 0.99
+    lam: 0.95
+    value_loss_coef: 1.0
+    entropy_coef: 0.01
+    learning_rate: 0.001
+    max_grad_norm: 1.0
+    use_clipped_value_loss: true
+    schedule: adaptive
+    desired_kl: 0.01
+    normalize_advantage_per_mini_batch: false
+  actor:
+    class_name: MLPModel
+    distribution_cfg:
+      class_name: GaussianDistribution
+      std_type: log
+      init_std: 1.0
+      std_range: [0.2, 2.0]
+  critic:
+    class_name: MLPModel

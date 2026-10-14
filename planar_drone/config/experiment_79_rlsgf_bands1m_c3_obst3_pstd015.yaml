@@ -1,0 +1,35 @@
+# experiment_79 = pure RL-SGF (experiment_16 algorithm settings: T rollouts, reset after update, no bootstrap,
+# 3 critic epochs) on the experiment_78 ENVIRONMENT (2026-09-29): 1 m wall/floor bands at flat r1 3, obstacle disc at
+# r1 3, oob + crash terminating, no obstacle termination, std floor 0.15. Fair-comparison baseline for exp78:
+# run 6000 iterations x 400 steps = 2.4 M env steps per env = exp78's 24000 x 100.
+runner:
+  num_steps_per_env: 0
+  num_steps_per_env_multiplier: 1
+  reset_after_update: true
+  terminate_on_obstacle: false
+  terminate_on_oob: true
+  terminate_on_crash: true
+  r1_walls: true
+  wall_margin: 1.0
+  unsafe_cost: 3.0
+  band_unsafe_cost: 3.0
+  r1_floor: true
+  floor_margin: 1.0
+  r1_mode: step
+  obs_groups: {"actor": ["policy"], "critic": ["policy", "privileged"]}
+  save_interval: 100
+  algorithm:
+    class_name: rsl_rl.algorithms.rl_sgf:RLSGF
+    bootstrap_final_state: false
+    critic_use_epochs: true
+    critic_epochs: 3
+    critic_minibatch: 131072
+  actor:
+    class_name: MLPModel
+    distribution_cfg:
+      class_name: GaussianDistribution
+      std_type: log
+      init_std: 1.0
+      std_range: [0.15, 2.0]
+  critic:
+    class_name: MLPModel

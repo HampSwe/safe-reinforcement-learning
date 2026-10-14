@@ -1,0 +1,33 @@
+# experiment_62 = experiment_61 (RL-SGF, no obstacle termination, r1 = 10 * |v| / 4 m/s inside the 1.3 r disc) with
+# alpha 5 -> 300 (2026-09-24). exp61 (killed at 2875 its): reward identical to exp16 but V1 sat at +2..+4.6 from
+# it ~400 on and hits only drifted 14 -> 10 % (exp16: 3.8 %) because |g1| ~ 115 (exp16: ~15) made
+# A = |g1|^2 - 2 alpha V1 ~ 1.5e4 and the demanded descent alpha h V1 ~ 0.006/update negligible: u ~ 0.25 vs
+# exp16's ~3. alpha ~ 5 x (115/15)^2 ~ 300 restores exp16's A / C balance (u ~ 2 alpha V1 / |g1|^2 in this regime).
+# Side effect: h_cap = 1/alpha = 0.0033 < h_ref 0.01, so h is capped at 0.0033 until sigma has shrunk to
+# ~0.58 sigma_ref (exp16 got there by ~500 x4-scaled its) -- slightly smaller task steps in the first ~500 its only.
+# Precedent: experiment_29 / logs/exp27 (alpha 20 at c = 0.95).
+runner:
+  num_steps_per_env: 0
+  num_steps_per_env_multiplier: 1
+  reset_after_update: true
+  terminate_on_obstacle: false
+  unsafe_cost: 10.0        # r1 inside the unsafe set (exp58: 30, exp16: 0.95); see header
+  unsafe_speed_ref: 4.0    # ... charged per unit path length: 10 * |v| / 4 m/s
+  obs_groups: {"actor": ["policy"], "critic": ["policy", "privileged"]}
+  save_interval: 100
+  algorithm:
+    class_name: rsl_rl.algorithms.rl_sgf:RLSGF
+    bootstrap_final_state: false
+    critic_use_epochs: true
+    critic_epochs: 3
+    critic_minibatch: 131072
+    alpha: 300.0   # exp61/exp16: 5; see header
+  actor:
+    class_name: MLPModel
+    distribution_cfg:
+      class_name: GaussianDistribution
+      std_type: log
+      init_std: 1.0
+      std_range: [0.2, 2.0]
+  critic:
+    class_name: MLPModel

@@ -1,0 +1,79 @@
+# experiment_68 = experiment_66 (SafePPO z 120, h_ref 0.01, cumulative per-step r1 at c = 0.95, split-half, fixed PPO lr
+# 3e-4, KL halving off, max_theta_step 0.5, project_std true, kappa 1, grad_v1_denom episode, y = 1) with
+# (2026-09-25): out-of-bounds no longer terminating, floor contact still terminating, and r1_floor (unsafe set =
+# obstacle disc U {y < 1 m}). Motivation: exp64/65/66 (logs/exp62/63/64) escaped the V1 constraint through the r1-free
+# oob / crash terminations (oob 40-49 %, crash 20-34 %); exp67 (logs/exp65, no terminations at all) sat on the floor
+# for 24000 its because the floor is absorbing (theta/omega keep tumbling under the y clamp). This keeps the floor
+# reset, removes the free oob exit, and makes the floor approach visible to V1 (the Isaac Lab low_altitude idea, in r1).
+runner:
+  num_steps_per_env: 100
+  curriculum_steps_per_env: 400
+  subtract_r1_from_r0: false
+  terminate_on_obstacle: false
+  terminate_on_oob: false     # exp68: leaving the world box no longer ends the episode (r0 penalizes distance; not absorbing)
+  terminate_on_crash: true    # exp68: floor contact still resets (exp67 showed the floor is absorbing without it)
+  r1_floor: true              # exp68: the band y < floor_margin joins the unsafe set, so V1 charges the approach to the floor
+  floor_margin: 1.0
+  r1_mode: step
+  obs_groups: {"actor": ["policy"], "critic": ["policy", "privileged"]}
+  save_interval: 500
+  algorithm:
+    class_name: rsl_rl.algorithms.safe_ppo:SafePPO
+    # --- PPO task channel ---
+    num_learning_epochs: 5
+    num_mini_batches: 4
+    clip_param: 0.2
+    gamma: 0.99
+    lam: 0.95
+    value_loss_coef: 1.0
+    entropy_coef: 0.005
+    learning_rate: 3.0e-04
+    max_grad_norm: 1.0
+    use_clipped_value_loss: true
+    schedule: fixed
+    desired_kl: 0.01
+    normalize_advantage_per_mini_batch: false
+    # --- safe gradient flow (Lemma-3 QCQP) ---
+    h: 0.01   # h_ref (exp64: 0.008, exp54: 0.005); task_gain = h z starts at 1.2
+    z: 120.0   # exp54: 200; |g0| = z |dtheta_ppo|
+    alpha: 1.0
+    eps: 1.0e-08
+    gamma1: 0.99
+    h_schedule: true
+    h_exp: 2.0
+    h_min: 1.0e-07
+    # --- safety channel ---
+    r1_scale: 1.0
+    dir_scale: 1.0
+    grad_v1_divide_by_T: true   # ignored with grad_v1_denom: episode
+    grad_v1_denom: episode
+    v1_estimate: start
+    split_half_norm: true
+    kappa_calibrate: false
+    kappa_fixed: 1.0   # paper L = 1/h
+    kappa_warmup: 300
+    kappa_cal_skip: 100
+    kappa_ema: 0.995
+    kappa_min: 0.01
+    kappa_max: 100.0
+    bootstrap_cost_returns: true
+    project_std: true   # std block under the QCQP + h z scaling (rl_sgf.py parity)
+    # --- cost critic (V1 baseline) ---
+    cost_critic_lr: 0.0003
+    cost_critic_epochs: 4
+    cost_critic_mini_batches: 4
+    cost_critic_max_grad_norm: 3.0
+    # --- trust region on the projected step ---
+    kl_budget: 0.08
+    kl_backoff_steps: 1   # halving off
+    max_theta_step: 0.5   # L2 clip on the whole applied step (rl_sgf.py parity), replaces the halving
+    memory_chunk_size: 50
+  actor:
+    class_name: MLPModel
+    distribution_cfg:
+      class_name: GaussianDistribution
+      std_type: log
+      init_std: 1.0
+      std_range: [0.2, 2.0]
+  critic:
+    class_name: MLPModel

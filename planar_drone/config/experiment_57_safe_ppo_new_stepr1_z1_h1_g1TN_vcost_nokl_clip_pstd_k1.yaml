@@ -1,0 +1,78 @@
+# experiment_57 = experiment_56 (z 1, h_ref 1, y 1, grad V1 / (T*N), sigma h schedule on, cumulative per-step r1,
+# split-half, fixed PPO lr 3e-4, KL halving off, max_theta_step 0.5, project_std true, kappa 1) with the unsafe-set
+# cost charged per unit PATH LENGTH instead of per step (runner.unsafe_speed_ref, 2026-09-24):
+#     r1 = unsafe_cost * |v| / unsafe_speed_ref   inside the 1.3 r disc   (unsafe_cost 0.95 unchanged)
+# so a crossing costs the same total whatever the speed -- a fast dash through the disc no longer buys a smaller
+# cumulative r1 than a slow one. unsafe_speed_ref = 4.0 m/s is the RL-SGF exp16 policy's transit speed (mean 4.00,
+# median 3.81 m/s over the steps > 0.5 m from the target; 3.1 m/s inside the disc, 5.6 steps per visit), so a
+# straight crossing at that speed costs exactly what it costs under the per-step rule (0.95 x 1.3 m / (4 m/s x 0.02 s)
+# = 15.4 undiscounted). Everything else identical to exp56. Caveat: loitering inside the disc is ~free.
+runner:
+  num_steps_per_env: 100
+  curriculum_steps_per_env: 400
+  subtract_r1_from_r0: false
+  terminate_on_obstacle: false
+  r1_mode: step
+  unsafe_speed_ref: 4.0   # r1 inside the unsafe set = 0.95 * |v| / 4 m/s (RL-SGF exp16 transit speed)
+  obs_groups: {"actor": ["policy"], "critic": ["policy", "privileged"]}
+  save_interval: 500
+  algorithm:
+    class_name: rsl_rl.algorithms.safe_ppo:SafePPO
+    # --- PPO task channel ---
+    num_learning_epochs: 5
+    num_mini_batches: 4
+    clip_param: 0.2
+    gamma: 0.99
+    lam: 0.95
+    value_loss_coef: 1.0
+    entropy_coef: 0.005
+    learning_rate: 3.0e-04
+    max_grad_norm: 1.0
+    use_clipped_value_loss: true
+    schedule: fixed
+    desired_kl: 0.01
+    normalize_advantage_per_mini_batch: false
+    # --- safe gradient flow (Lemma-3 QCQP) ---
+    h: 1.0   # h_ref = 1/z; task_gain = h z starts at 1 (h_cap = 1/alpha = 1)
+    z: 1.0   # |g0| = |dtheta_ppo|
+    alpha: 1.0
+    eps: 1.0e-08
+    gamma1: 0.99
+    h_schedule: true
+    h_exp: 2.0
+    h_min: 1.0e-07
+    # --- safety channel ---
+    r1_scale: 1.0
+    dir_scale: 1.0
+    grad_v1_divide_by_T: true   # with grad_v1_denom legacy: grad V1 = sum / (T*N)
+    grad_v1_denom: legacy
+    v1_estimate: start
+    split_half_norm: true
+    kappa_calibrate: false
+    kappa_fixed: 1.0   # paper L = 1/h
+    kappa_warmup: 300
+    kappa_cal_skip: 100
+    kappa_ema: 0.995
+    kappa_min: 0.01
+    kappa_max: 100.0
+    bootstrap_cost_returns: true
+    project_std: true   # std block under the QCQP + h z scaling (rl_sgf.py parity)
+    # --- cost critic (V1 baseline) ---
+    cost_critic_lr: 0.0003
+    cost_critic_epochs: 4
+    cost_critic_mini_batches: 4
+    cost_critic_max_grad_norm: 3.0
+    # --- trust region on the projected step ---
+    kl_budget: 0.08
+    kl_backoff_steps: 1   # halving off
+    max_theta_step: 0.5   # L2 clip on the whole applied step (rl_sgf.py parity), replaces the halving
+    memory_chunk_size: 50
+  actor:
+    class_name: MLPModel
+    distribution_cfg:
+      class_name: GaussianDistribution
+      std_type: log
+      init_std: 1.0
+      std_range: [0.2, 2.0]
+  critic:
+    class_name: MLPModel

@@ -1,0 +1,39 @@
+# experiment_31 = experiment_16 (RL-SGF alpha 5, no obstacle termination) with the PER-EPISODE safety cost
+# (runner.r1_mode: episode, 2026-09-20): r1 = +1 at the first entry into the unsafe set (1.3 x obstacle radius)
+# of an episode and -collision_budget/T on every step, undiscounted in the r1 channel (algorithm.gamma1: 1.0),
+# so V1 <= 0 <=> P(episode enters the unsafe set) <= collision_budget = 0.05. Motivation: the per-step r1
+# (-beta .. / 0.95 in the set) is a budget on unsafe STEPS (5 %), which SafePPO (exp30) showed is satisfied by
+# 30 % of episodes brushing the disc (V1 -2.45, u = 0, reward 177 = PPO); RL-SGF's 3.7 % on that r1 (exp16)
+# came from the QCQP being permanently active (|grad V0|^2 >> 2 alpha V1), not from the budget (alpha 20 -> 14.5 %).
+# No distance shaping in this mode. Watch Episode/ep_unsafe_entry (what is bounded) and Episode/ep_hit_obstacle.
+# RL-SGF, experiment_05 settings (T rollouts, reset after update, no bootstrap, 3 critic epochs), but the
+# episode is NOT terminated when the drone enters the obstacle disc (runner.terminate_on_obstacle: false,
+# 2026-09-19). Obstacle contact then enters only through the safety cost r1 (V1 constraint); the drone
+# passes through the disc. Collision rate to read: Episode/ep_hit_obstacle (hit at least once per episode).
+# 4000 iterations x 400 steps = 1.6 M env steps per env.
+runner:
+  num_steps_per_env: 0
+  num_steps_per_env_multiplier: 1
+  reset_after_update: true
+  terminate_on_obstacle: false
+  r1_mode: episode
+  r1_credit: step   # -collision_budget/T per step (pre-2026-09-21 behaviour; 'start' is now the default)
+  collision_budget: 0.05
+  obs_groups: {"actor": ["policy"], "critic": ["policy", "privileged"]}
+  save_interval: 100
+  algorithm:
+    class_name: rsl_rl.algorithms.rl_sgf:RLSGF
+    bootstrap_final_state: false
+    critic_use_epochs: true
+    critic_epochs: 3
+    critic_minibatch: 131072
+    gamma1: 1.0
+  actor:
+    class_name: MLPModel
+    distribution_cfg:
+      class_name: GaussianDistribution
+      std_type: log
+      init_std: 1.0
+      std_range: [0.2, 2.0]
+  critic:
+    class_name: MLPModel

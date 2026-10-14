@@ -1,0 +1,34 @@
+runner:
+  num_steps_per_env: 0
+  num_steps_per_env_multiplier: 1  # T -- one episode length per rollout/update
+  reset_after_update: true
+  obs_groups: {"actor": ["policy"], "critic": ["policy", "privileged"]}
+  save_interval: 100
+  algorithm:
+    class_name: rsl_rl.algorithms.rl_sgf_ppo_v0:RLSGF_PPO_V0
+    bootstrap_final_state: true
+    critic_use_epochs: true
+    critic_epochs: 3
+    critic_minibatch: 131072
+    # PPO settings driving the V0 (reward) phase; V1 (safety) is unchanged RL-SGF.
+    num_learning_epochs: 5
+    num_mini_batches: 4
+    clip_param: 0.2
+    lam: 0.95
+    value_loss_coef: 1.0
+    entropy_coef: 0.01
+    learning_rate: 0.001
+    max_grad_norm: 1.0
+    use_clipped_value_loss: true
+    schedule: adaptive
+    desired_kl: 0.01
+    normalize_advantage_per_mini_batch: false
+  actor:
+    class_name: MLPModel
+    distribution_cfg:
+      class_name: GaussianDistribution
+      std_type: log
+      init_std: 1.0
+      std_range: [0.2, 2.0]
+  critic:
+    class_name: MLPModel

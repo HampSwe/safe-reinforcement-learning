@@ -1,0 +1,107 @@
+# experiment_35 = experiment_34 (SafePPO, per-episode r1 with credit at start, V1 from episode-start rows, grad V1
+# per episode) with the QCQP put on calibrated units (2026-09-22). exp34 was no longer degenerate but inert:
+# |grad V1| ~ 10 was almost entirely REINFORCE sampling noise (V1 lives in [-0.05, 0.95]), so A = |g1|^2 - 2 alpha V1
+# was huge, u ~ 0.003, and the constraint never bit (20 % unsafe entries at V1 = +0.15).
+#   algorithm.split_half_norm: true   |grad V1|^2 in A / Delta / |g1 - g0|^2 is <g1_a, g1_b> (gradient estimated on
+#                                    the two env halves, independent rollouts): unbiased, not noise-inflated.
+#   algorithm.kappa_calibrate: true   the constraint g1'xi + 1/2|xi|^2 <= -alpha V1 has an implicit curvature 1;
+#                                    the true model is dV1 ~ g1'dtheta + L/2 |dtheta|^2. L_hat is regressed online
+#                                    from (dV1_obs - g1'dtheta) vs |dtheta|^2 / 2 (EMA 0.995), kappa = L_hat h, and
+#                                    the closed form is called on (kappa g0, g1, V1, alpha kappa, h / kappa), which
+#                                    leaves the unconstrained step (= the PPO step) and alpha h |V1| unchanged.
+#                                    The regression starts after kappa_cal_skip = 100 updates (cost-critic warm-up);
+#                                    kappa = 1 (legacy) is used for the first kappa_warmup = 300 updates; clamp [1e-2, 1e2].
+# Same 24000 x 100 budget, seed 1.
+# experiment_34 = experiment_32 (SafePPO alpha 1, r1_scale 1, h fixed 0.05, no obstacle termination, PER-EPISODE r1,
+# budget 0.05, gamma1 1) with the V1 channel put in consistent units (2026-09-21):
+#   runner.r1_credit: start        -collision_budget paid once at t = 1 (not /T per step), so every episode's r1
+#                                  return is exactly 1{unsafe entry} - 0.05 whatever its length (exp33 for RL-SGF).
+#   algorithm.v1_estimate: start   V1 = mean rtg1 over the rows where an episode STARTS (= samples of V1(s_0)),
+#                                  instead of over all rows. exp32 averaged all rows: mid-episode rows carry no
+#                                  credit and only "future hit" mass, so V1 was ~ +0.01 at 3 % entries and the
+#                                  QCQP was degenerate (A < 0, applied step ~1e-4) on 100 % of iterations.
+#   algorithm.grad_v1_denom: episode   grad V1 = sum over all rows / number of episodes in the window (EMA of
+#                                  dones), i.e. the policy-gradient theorem for V1(s_0), replacing the /(T*N)
+#                                  mean (grad_v1_divide_by_T) that shrank |grad V1|^2 by ~1/T^2 relative to V1.
+# r1_scale stays 1. Same 24000 x 100 budget.
+# experiment_30 = experiment_28 (SafePPO, alpha 1, r1_scale 1, h fixed 0.05, no obstacle termination) with the unsafe
+# cost back at the env default 1 - beta = 0.95 (runner.unsafe_cost omitted), i.e. the SafePPO counterpart of the
+# RL-SGF run experiment_16 (131 reward / 3.7 % collisions / V1 -3.6 at 6000 x 400 steps). Same 24000 x 100 budget.
+# exp27/28 (cost 10) both stalled at ~52 reward (4.9 % / 8.0 % collisions); h fixed is used here because with the
+# sigma h schedule every PPO step was projected (u never 0) regardless of constraint slack.
+# experiment_24 = experiment_23 with the sigma-based h schedule ON (h = 0.05 * (sigma_min/sigma_ref)^2, as in RL-SGF).
+# With h fixed at 0.05 the projection was inert: V1 ~ +190 yet u ~ 2e-4, because the constraint only asks for
+# dV1 <= alpha*h*V1 per step and the PPO step already "predicted" that (it ~9900: 20 % collisions, reward 151).
+# SafePPO (experiment_15 settings: PPO lr 1e-4 adaptive / ent 0.005 + RL-SGF closed-form projection with
+# r1_scale 30, alpha 1/30, h 0.05, kl_budget 0.08) on the NO-OBSTACLE-TERMINATION task with r1 = 30 inside the
+# unsafe set (experiment_21 counterpart: runner.terminate_on_obstacle false, unsafe_cost 30; 2026-09-19).
+# r1_scale 30 is kept as in the 5-seed hand-off sweep: it rescales the whole r1 the safety channel sees (an
+# exact reparameterisation of dir_scale 30 / alpha 1) and does not move the V1 <= 0 boundary; the env's
+# unsafe_cost 30 does. Collision rate: Episode/ep_hit_obstacle. Budget 24000 x 100 = 6000 x 400 env steps.
+runner:
+  num_steps_per_env: 100
+  curriculum_steps_per_env: 400
+  subtract_r1_from_r0: false
+  terminate_on_obstacle: false
+  r1_mode: episode
+  r1_credit: start
+  collision_budget: 0.05
+  obs_groups: {"actor": ["policy"], "critic": ["policy", "privileged"]}
+  save_interval: 500
+  algorithm:
+    class_name: rsl_rl.algorithms.safe_ppo:SafePPO
+    # --- PPO task channel ---
+    num_learning_epochs: 5
+    num_mini_batches: 4
+    clip_param: 0.2
+    gamma: 0.99
+    lam: 0.95
+    value_loss_coef: 1.0
+    entropy_coef: 0.005
+    learning_rate: 0.0001
+    max_grad_norm: 1.0
+    use_clipped_value_loss: true
+    schedule: adaptive
+    desired_kl: 0.01
+    normalize_advantage_per_mini_batch: false
+    # --- safe gradient flow (Lemma-3 QCQP) ---
+    h: 0.05
+    alpha: 1.0
+    eps: 1.0e-08
+    gamma1: 1.0
+    h_schedule: false
+    h_exp: 2.0
+    h_min: 1.0e-07
+    # --- safety channel ---
+    r1_scale: 1.0
+    dir_scale: 1.0
+    grad_v1_divide_by_T: true   # ignored with grad_v1_denom: episode
+    grad_v1_denom: episode
+    v1_estimate: start
+    split_half_norm: true
+    kappa_calibrate: true
+    kappa_warmup: 300
+    kappa_cal_skip: 100
+    kappa_ema: 0.995
+    kappa_min: 0.01
+    kappa_max: 100.0
+    bootstrap_cost_returns: true
+    project_std: false
+    # --- cost critic (V1 baseline) ---
+    cost_critic_lr: 0.0003
+    cost_critic_epochs: 4
+    cost_critic_mini_batches: 4
+    cost_critic_max_grad_norm: 3.0
+    # --- trust region on the projected step ---
+    kl_budget: 0.08
+    kl_backoff_steps: 5
+    memory_chunk_size: 50
+  actor:
+    class_name: MLPModel
+    distribution_cfg:
+      class_name: GaussianDistribution
+      std_type: log
+      init_std: 1.0
+      std_range: [0.2, 2.0]
+  critic:
+    class_name: MLPModel

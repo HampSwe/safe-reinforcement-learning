@@ -1,0 +1,79 @@
+# experiment_41 = experiment_38 (new SafePPO: per-episode r1 credit at start, V1 from start rows, grad V1 per episode,
+# split-half |grad V1|^2, fixed kappa 0.25, spe 100) with a GAE-style advantage on the cost channel (2026-09-22):
+#   algorithm.cost_adv: gae, cost_lam: 0.95   grad V1 weights are GAE(gamma1, 0.95) built from the one-step TD
+#                                             residuals r1_t + gamma1 V1_hat(s_t+1) - V1_hat(s_t), as PPO does for
+#                                             the task advantage, instead of the bootstrapped MC return minus the
+#                                             critic baseline. Cuts the sampling variance of g1 (~40 % lower advantage
+#                                             std in a probe) at the price of critic bias. The V1 LEVEL is unchanged.
+# kappa 0.25 kept: the 1-hour probe exp40 (kappa 0.5, 4200 it) was worse than exp38 at every block (reward 3-7 vs
+# 20-38, oob 55-88 % vs 8-60 %). Budget 16000 x 100 = 4000 x 400 env steps, seed 1.
+runner:
+  num_steps_per_env: 100
+  curriculum_steps_per_env: 400
+  subtract_r1_from_r0: false
+  terminate_on_obstacle: false
+  r1_mode: episode
+  r1_credit: start
+  collision_budget: 0.05
+  obs_groups: {"actor": ["policy"], "critic": ["policy", "privileged"]}
+  save_interval: 500
+  algorithm:
+    class_name: rsl_rl.algorithms.safe_ppo:SafePPO
+    # --- PPO task channel ---
+    num_learning_epochs: 5
+    num_mini_batches: 4
+    clip_param: 0.2
+    gamma: 0.99
+    lam: 0.95
+    value_loss_coef: 1.0
+    entropy_coef: 0.005
+    learning_rate: 0.0001
+    max_grad_norm: 1.0
+    use_clipped_value_loss: true
+    schedule: adaptive
+    desired_kl: 0.01
+    normalize_advantage_per_mini_batch: false
+    # --- safe gradient flow (Lemma-3 QCQP) ---
+    h: 0.05
+    alpha: 1.0
+    eps: 1.0e-08
+    gamma1: 1.0
+    h_schedule: false
+    h_exp: 2.0
+    h_min: 1.0e-07
+    # --- safety channel ---
+    r1_scale: 1.0
+    dir_scale: 1.0
+    grad_v1_divide_by_T: true   # ignored with grad_v1_denom: episode
+    grad_v1_denom: episode
+    v1_estimate: start
+    split_half_norm: true
+    kappa_calibrate: false
+    kappa_fixed: 0.25
+    cost_adv: gae
+    cost_lam: 0.95
+    kappa_warmup: 300
+    kappa_cal_skip: 100
+    kappa_ema: 0.995
+    kappa_min: 0.01
+    kappa_max: 100.0
+    bootstrap_cost_returns: true
+    project_std: false
+    # --- cost critic (V1 baseline) ---
+    cost_critic_lr: 0.0003
+    cost_critic_epochs: 4
+    cost_critic_mini_batches: 4
+    cost_critic_max_grad_norm: 3.0
+    # --- trust region on the projected step ---
+    kl_budget: 0.08
+    kl_backoff_steps: 5
+    memory_chunk_size: 50
+  actor:
+    class_name: MLPModel
+    distribution_cfg:
+      class_name: GaussianDistribution
+      std_type: log
+      init_std: 1.0
+      std_range: [0.2, 2.0]
+  critic:
+    class_name: MLPModel

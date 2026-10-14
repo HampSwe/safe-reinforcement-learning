@@ -1,0 +1,21 @@
+W0809 07:17:40.518000 4680 Lib\site-packages\torch\onnx\_internal\exporter\_registration.py:107] torchvision is not installed. Skipping torchvision::nms
+W0809 07:17:40.521000 4680 Lib\site-packages\torch\onnx\_internal\exporter\_registration.py:107] torchvision is not installed. Skipping torchvision::roi_align
+W0809 07:17:40.523000 4680 Lib\site-packages\torch\onnx\_internal\exporter\_registration.py:107] torchvision is not installed. Skipping torchvision::roi_pool
+W0809 07:17:40.526000 4680 Lib\site-packages\torch\onnx\_internal\exporter\_registration.py:107] torchvision is not installed. Skipping torchvision::deform_conv2d
+C:\Users\hampus\AppData\Local\Python\pythoncore-3.14-64\Lib\copyreg.py:104: FutureWarning: `isinstance(treespec, LeafSpec)` is deprecated, use `isinstance(treespec, TreeSpec) and treespec.is_leaf()` instead.
+  return cls.__new__(cls, *args)
+Traceback (most recent call last):
+  File "F:\Hampus\caltech\surf\planar_drone\train.py", line 186, in <module>
+    main(
+    ~~~~^
+        config=args.config,
+        ^^^^^^^^^^^^^^^^^^^
+    ...<3 lines>...
+        run_name=args.run_name,
+        ^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "F:\Hampus\caltech\surf\planar_drone\train.py", line 42, in main
+    with open(config_path, "r", encoding="utf-8") as f:
+         ~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: 'F:\\Hampus\\caltech\\surf\\planar_drone\\config\\config_b.yaml'

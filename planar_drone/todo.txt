@@ -1,0 +1,33 @@
+
+
+Ideas:
+make reward positive around target, to prevent it from preferring termination
+give sparse negative reward when tipping over
+
+
+a bit more tweak for the flicking, or just train again. prob inc weight. split?
+train with even more disturbances. Perhaps allow it to start closer to border? Nah
+
+
+- see effects of speed and upright conditions
+- dont terminate when tipping over
+- terminate on ground and give negative reward
+
+- read reinf
+- thm
+- trick proof
+
+- do stats for number of terminations
+
+- show learning improvement over time, show many at the same time
+- add large negative reward for tipping over, end of screen, ground
+
+- activate policy while playing game
+
+- add random obstacle, only negative reward for touching
+- negative linear reward starting while being close
+
+
+
+split action into two terms
+dont allow F 0

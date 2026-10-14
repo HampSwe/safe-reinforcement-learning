@@ -1,0 +1,65 @@
+# experiment_24 = experiment_23 with the sigma-based h schedule ON (h = 0.05 * (sigma_min/sigma_ref)^2, as in RL-SGF).
+# With h fixed at 0.05 the projection was inert: V1 ~ +190 yet u ~ 2e-4, because the constraint only asks for
+# dV1 <= alpha*h*V1 per step and the PPO step already "predicted" that (it ~9900: 20 % collisions, reward 151).
+# SafePPO (experiment_15 settings: PPO lr 1e-4 adaptive / ent 0.005 + RL-SGF closed-form projection with
+# r1_scale 30, alpha 1/30, h 0.05, kl_budget 0.08) on the NO-OBSTACLE-TERMINATION task with r1 = 30 inside the
+# unsafe set (experiment_21 counterpart: runner.terminate_on_obstacle false, unsafe_cost 30; 2026-09-19).
+# r1_scale 30 is kept as in the 5-seed hand-off sweep: it rescales the whole r1 the safety channel sees (an
+# exact reparameterisation of dir_scale 30 / alpha 1) and does not move the V1 <= 0 boundary; the env's
+# unsafe_cost 30 does. Collision rate: Episode/ep_hit_obstacle. Budget 24000 x 100 = 6000 x 400 env steps.
+runner:
+  num_steps_per_env: 100
+  curriculum_steps_per_env: 400
+  subtract_r1_from_r0: false
+  terminate_on_obstacle: false
+  unsafe_cost: 30.0
+  obs_groups: {"actor": ["policy"], "critic": ["policy", "privileged"]}
+  save_interval: 500
+  algorithm:
+    class_name: rsl_rl.algorithms.safe_ppo:SafePPO
+    # --- PPO task channel ---
+    num_learning_epochs: 5
+    num_mini_batches: 4
+    clip_param: 0.2
+    gamma: 0.99
+    lam: 0.95
+    value_loss_coef: 1.0
+    entropy_coef: 0.005
+    learning_rate: 0.0001
+    max_grad_norm: 1.0
+    use_clipped_value_loss: true
+    schedule: adaptive
+    desired_kl: 0.01
+    normalize_advantage_per_mini_batch: false
+    # --- safe gradient flow (Lemma-3 QCQP) ---
+    h: 0.05
+    alpha: 0.0333333
+    eps: 1.0e-08
+    gamma1: 0.99
+    h_schedule: true
+    h_exp: 2.0
+    h_min: 1.0e-07
+    # --- safety channel ---
+    r1_scale: 30.0
+    dir_scale: 1.0
+    grad_v1_divide_by_T: true
+    bootstrap_cost_returns: true
+    project_std: false
+    # --- cost critic (V1 baseline) ---
+    cost_critic_lr: 0.0003
+    cost_critic_epochs: 4
+    cost_critic_mini_batches: 4
+    cost_critic_max_grad_norm: 3.0
+    # --- trust region on the projected step ---
+    kl_budget: 0.08
+    kl_backoff_steps: 5
+    memory_chunk_size: 50
+  actor:
+    class_name: MLPModel
+    distribution_cfg:
+      class_name: GaussianDistribution
+      std_type: log
+      init_std: 1.0
+      std_range: [0.2, 2.0]
+  critic:
+    class_name: MLPModel
